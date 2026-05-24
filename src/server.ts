@@ -534,7 +534,7 @@ function getSessionDir(): string {
  * CONTEXT_MODE_PROJECT_DIR guarantees correct projectDir even for platforms
  * that don't set their own env var (Cursor, OpenClaw, Codex, Kiro, Zed).
  */
-function getProjectDir(): string {
+export function getProjectDir(): string {
   const override = projectDirOverride.getStore();
   if (override) return override.projectDir;
 
@@ -569,13 +569,21 @@ function getProjectDir(): string {
   // and the legacy literal cascade is preserved there for semver safety.
   let transcriptsRoot: string | undefined;
   let strictPlatform: PlatformId | undefined;
+  let codexHome: string | undefined;
   try {
     const detected = detectPlatform().platform;
     strictPlatform = detected;
     if (detected === "claude-code") {
       transcriptsRoot = join(homedir(), ".claude", "projects");
     }
-  } catch { /* detection failure — leave both undefined, resolver uses legacy cascade */ }
+    // Issue #45 — Codex publishes no workspace env var, so the resolver
+    // reads `meta.cwd` from the most-recently-modified session.jsonl under
+    // `${codexHome}/sessions/`. Wire codexHome at the call site so the
+    // resolver can be exercised under test without process-level mutation.
+    if (detected === "codex") {
+      codexHome = process.env.CODEX_HOME ?? join(homedir(), ".codex");
+    }
+  } catch { /* detection failure — leave undefined, resolver uses legacy cascade */ }
   return resolveProjectDir({
     env: process.env,
     cwd: process.cwd(),
@@ -583,6 +591,7 @@ function getProjectDir(): string {
     transcriptsRoot,
     transcriptMaxAgeMs: 5 * 60 * 1000,
     strictPlatform,
+    codexHome,
   });
 }
 
@@ -1976,7 +1985,7 @@ EXAMPLE: ctx_index(path: "/path/to/large-spec.md", source: "openapi-v2-spec")`,
         .string()
         .optional()
         .describe(
-          "File path to read and index (content never enters context). Provide this OR content.",
+          "File OR directory path to read and index (content never enters context). Provide this OR content. Directory paths trigger a bounded recursive walk (#687).",
         ),
       source: z
         .string()
@@ -1984,9 +1993,30 @@ EXAMPLE: ctx_index(path: "/path/to/large-spec.md", source: "openapi-v2-spec")`,
         .describe(
           "Label for the indexed content (e.g., 'Context7: React useEffect', 'Skill: frontend-design')",
         ),
+      include: z.array(z.string()).optional().describe(
+        "Directory-only: glob patterns to include (default: all matching extensions).",
+      ),
+      exclude: z.array(z.string()).optional().describe(
+        "Directory-only: glob patterns to exclude. Merged with defaults (node_modules, .git, dist, build, .next, coverage, .venv, __pycache__, .DS_Store).",
+      ),
+      maxDepth: z.number().int().min(0).optional().describe(
+        "Directory-only: max recursion depth from root (default: 5).",
+      ),
+      maxFiles: z.number().int().min(1).optional().describe(
+        "Directory-only: hard cap on files indexed (default: 200) — FTS5 blow-up guard.",
+      ),
+      extensions: z.array(z.string()).optional().describe(
+        "Directory-only: allowed file extensions (default: .md .mdx .txt .json .yaml .yml .ts .tsx .js .jsx .py .rs .go .sh).",
+      ),
+      respectGitignore: z.boolean().optional().describe(
+        "Directory-only: apply nearest .gitignore (default: true).",
+      ),
+      followSymlinks: z.boolean().optional().describe(
+        "Directory-only: follow directory symlinks (default: false — cycle hazard + escape risk).",
+      ),
     }),
   },
-  async ({ content, path, source }) => {
+  async ({ content, path, source, include, exclude, maxDepth, maxFiles, extensions, respectGitignore, followSymlinks }) => {
     if (!content && !path) {
       return trackResponse("ctx_index", {
         content: [
@@ -2010,6 +2040,55 @@ EXAMPLE: ctx_index(path: "/path/to/large-spec.md", source: "openapi-v2-spec")`,
 
     try {
       const resolvedPath = path ? resolveProjectPath(path) : undefined;
+
+      // Directory dispatch (#687, reported by @matiasduartee). When the
+      // resolved path is a directory, walk it bounded and re-enter `index()`
+      // per-file so the security gate at store.ts:845 (TOCTOU defense from
+      // #442 round-3) keeps running for every file.
+      if (resolvedPath && existsSync(resolvedPath) && statSync(resolvedPath).isDirectory()) {
+        const store = getStore();
+        const projectDir = getProjectDir();
+        const denyGlobs = readToolDenyPatterns("Read", projectDir);
+        const isWin32 = process.platform === "win32";
+        const perFileDeny = (absPath: string): boolean => {
+          try {
+            return evaluateFilePath(absPath, denyGlobs, isWin32, projectDir).denied;
+          } catch {
+            return false; // fail-open consistent with checkFilePathDenyPolicy
+          }
+        };
+        const dirResult = store.indexDirectory({
+          path: resolvedPath,
+          source: source ?? resolvedPath,
+          attribution: currentAttribution(),
+          perFileDeny,
+          include,
+          exclude,
+          maxDepth,
+          maxFiles,
+          extensions,
+          respectGitignore,
+          followSymlinks,
+        });
+        const capNote = dirResult.capped
+          ? ` (cap reached — only first ${dirResult.filesIndexed} of ${dirResult.totalSeen}+ files; raise maxFiles to index more)`
+          : "";
+        const denyNote = dirResult.denied > 0
+          ? ` (${dirResult.denied} file${dirResult.denied === 1 ? "" : "s"} blocked by Read deny policy)`
+          : "";
+        const failNote = dirResult.failed > 0
+          ? ` (${dirResult.failed} file${dirResult.failed === 1 ? "" : "s"} failed to read)`
+          : "";
+        return trackResponse("ctx_index", {
+          content: [
+            {
+              type: "text" as const,
+              text: `Indexed ${dirResult.filesIndexed} file${dirResult.filesIndexed === 1 ? "" : "s"} (${dirResult.totalChunks} sections) from directory: ${dirResult.label}${capNote}${denyNote}${failNote}\nUse ctx_search(queries: ["..."]) to query this content.`,
+            },
+          ],
+        });
+      }
+
       // Track the raw bytes being indexed (content or file)
       if (content) trackIndexed(Buffer.byteLength(content));
       else if (resolvedPath) {
